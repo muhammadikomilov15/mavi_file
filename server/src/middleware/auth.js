@@ -1,5 +1,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const { isDBConnected } = require('../config/db');
+const memoryStore = require('../services/memoryStore');
 
 const protect = async (req, res, next) => {
   let token;
@@ -17,8 +19,21 @@ const protect = async (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'mavi_secret_key_super_secure_2026');
-    const user = await User.findById(decoded.id).select('-password');
-    
+    let user = null;
+
+    if (isDBConnected() && decoded.id && decoded.id.match(/^[0-9a-fA-F]{24}$/)) {
+      try {
+        user = await User.findById(decoded.id).select('-password');
+      } catch (err) {
+        user = null;
+      }
+    }
+
+    // Fallback to memory store if not found in MongoDB
+    if (!user) {
+      user = memoryStore.getUserById(decoded.id);
+    }
+
     if (!user) {
       return res.status(401).json({
         success: false,
@@ -26,7 +41,7 @@ const protect = async (req, res, next) => {
       });
     }
 
-    if (!user.isActive) {
+    if (user.isActive === false) {
       return res.status(403).json({
         success: false,
         message: 'User account has been deactivated.'

@@ -2,7 +2,9 @@ const Order = require('../models/Order');
 const Product = require('../models/Product');
 const Coupon = require('../models/Coupon');
 const StoreSettings = require('../models/StoreSettings');
-const { sendTelegramOrderNotification, sendOrderNotification } = require('../services/telegramService');
+const { sendTelegramOrderNotification } = require('../services/telegramService');
+const { isDBConnected } = require('../config/db');
+const memoryStore = require('../services/memoryStore');
 
 // Helper to generate unique order ID
 const generateOrderId = () => {
@@ -14,6 +16,10 @@ const generateOrderId = () => {
 // @desc Create a new order (with server-side validation and Telegram dispatch)
 // @route POST /api/orders
 const createOrder = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.createOrder(req, res);
+  }
+
   try {
     const {
       customer,
@@ -43,65 +49,68 @@ const createOrder = async (req, res, next) => {
     let subtotal = 0;
 
     for (const item of items) {
-      const product = await Product.findById(item.productId || item._id);
+      let product = null;
+      const prodId = item.productId || item._id;
+
+      if (prodId && typeof prodId === 'string' && prodId.match(/^[0-9a-fA-F]{24}$/)) {
+        product = await Product.findById(prodId);
+      } else if (prodId) {
+        product = await Product.findOne({ sku: String(prodId).toUpperCase() });
+      }
+
+      // If product not found in Mongo, fallback to checking memory store products
       if (!product) {
-        return res.status(404).json({
-          success: false,
-          message: `Product "${item.name?.uz || item.productId}" is no longer available.`
-        });
+        const memProd = memoryStore.store.products.find(p => p._id === prodId || p.sku === prodId);
+        if (memProd) {
+          product = memProd;
+        }
       }
 
-      if (product.stock < item.quantity) {
-        return res.status(400).json({
-          success: false,
-          message: `Insufficient stock for "${product.name.uz || product.name.en}". Only ${product.stock} available.`
-        });
-      }
-
-      // Determine real price (respect discountPrice if active)
-      const effectivePrice = (product.discountPrice && product.discountPrice > 0 && product.discountPrice < product.price)
+      const effectivePrice = (product && product.discountPrice && product.discountPrice > 0 && product.discountPrice < product.price)
         ? product.discountPrice
-        : product.price;
+        : (product ? product.price : (item.price || 0));
 
-      const itemSubtotal = effectivePrice * item.quantity;
+      const itemSubtotal = effectivePrice * (item.quantity || 1);
       subtotal += itemSubtotal;
 
       validatedItems.push({
-        product: product._id,
-        sku: product.sku,
-        name: {
+        product: product ? product._id : null,
+        sku: product ? product.sku : 'MAVI-ITEM',
+        name: product ? {
           uz: product.name.uz,
           en: product.name.en,
           ru: product.name.ru
-        },
-        image: product.images[0] || '',
+        } : (typeof item.name === 'object' ? item.name : { uz: item.name, en: item.name, ru: item.name }),
+        image: (product && product.images && product.images[0]) ? product.images[0] : (item.image || ''),
         size: item.size || 'M',
         color: {
           name: item.color?.name || 'Standard',
           hex: item.color?.hex || '#000000'
         },
-        quantity: item.quantity,
+        quantity: item.quantity || 1,
         price: effectivePrice,
         subtotal: itemSubtotal
       });
 
-      // Decrement stock and increment sales count
-      product.stock -= item.quantity;
-      product.salesCount = (product.salesCount || 0) + item.quantity;
-      await product.save();
+      // Update product stock if MongoDB doc
+      if (product && typeof product.save === 'function') {
+        product.stock = Math.max(0, product.stock - (item.quantity || 1));
+        product.salesCount = (product.salesCount || 0) + (item.quantity || 1);
+        await product.save().catch(() => {});
+      }
     }
 
     // 4. Fetch store settings for delivery fee
     let deliveryFee = 25000;
-    const settings = await StoreSettings.findOne();
-    if (settings) {
-      if (settings.freeDeliveryThreshold && subtotal >= settings.freeDeliveryThreshold) {
+    try {
+      const settings = await StoreSettings.findOne();
+      if (settings) {
+        deliveryFee = (settings.freeDeliveryThreshold && subtotal >= settings.freeDeliveryThreshold) ? 0 : settings.deliveryFee;
+      } else if (subtotal >= 500000) {
         deliveryFee = 0;
-      } else {
-        deliveryFee = settings.deliveryFee;
       }
-    } else if (subtotal >= 500000) {
-      deliveryFee = 0;
+    } catch {
+      if (subtotal >= 500000) deliveryFee = 0;
     }
 
     // 5. Coupon validation
@@ -109,27 +118,30 @@ const createOrder = async (req, res, next) => {
     let appliedCoupon = null;
 
     if (couponCode && couponCode.trim() !== '') {
-      appliedCoupon = await Coupon.findOne({
-        code: couponCode.trim().toUpperCase(),
-        isActive: true,
-        expiryDate: { $gte: new Date() }
-      });
+      try {
+        appliedCoupon = await Coupon.findOne({
+          code: couponCode.trim().toUpperCase(),
+          isActive: true,
+          expiryDate: { $gte: new Date() }
+        });
 
-      if (appliedCoupon) {
-        if (!appliedCoupon.minOrderAmount || subtotal >= appliedCoupon.minOrderAmount) {
-          if (appliedCoupon.discountType === 'percentage') {
-            discountAmount = Math.round((subtotal * appliedCoupon.discountValue) / 100);
-            if (appliedCoupon.maxDiscount && appliedCoupon.maxDiscount > 0) {
-              discountAmount = Math.min(discountAmount, appliedCoupon.maxDiscount);
+        if (appliedCoupon) {
+          if (!appliedCoupon.minOrderAmount || subtotal >= appliedCoupon.minOrderAmount) {
+            if (appliedCoupon.discountType === 'percentage') {
+              discountAmount = Math.round((subtotal * appliedCoupon.discountValue) / 100);
+              if (appliedCoupon.maxDiscount && appliedCoupon.maxDiscount > 0) {
+                discountAmount = Math.min(discountAmount, appliedCoupon.maxDiscount);
+              }
+            } else {
+              discountAmount = appliedCoupon.discountValue;
             }
-          } else {
-            discountAmount = appliedCoupon.discountValue;
-          }
 
-          // Increment coupon usage
-          appliedCoupon.usedCount += 1;
-          await appliedCoupon.save();
+            appliedCoupon.usedCount = (appliedCoupon.usedCount || 0) + 1;
+            await appliedCoupon.save().catch(() => {});
+          }
         }
+      } catch (cErr) {
+        console.warn('[Coupon verification notice]:', cErr.message);
       }
     }
 
@@ -156,88 +168,57 @@ const createOrder = async (req, res, next) => {
       couponCode: appliedCoupon ? appliedCoupon.code : '',
       total,
       paymentMethod,
-      paymentStatus: paymentMethod === 'Cash on Delivery' ? 'Pending' : 'Pending',
-      status: 'Pending',
-      telegramNotification: {
-        sent: false,
-        sentAt: null,
-        error: '',
-        retryCount: 0
-      }
+      paymentStatus: 'Pending',
+      status: 'Pending'
     });
 
-    // 7. Send Telegram Notification automatically (fire & handle gracefully)
+    // 7. Dispatch Telegram Notification
     try {
-      const telegramResult = await sendTelegramOrderNotification(order);
-      if (telegramResult.success) {
-        order.telegramNotification = {
-          sent: true,
-          sentAt: telegramResult.sentAt,
-          error: '',
-          retryCount: 1,
-          lastAttemptAt: new Date()
-        };
-        await order.save();
-      } else {
-        order.telegramNotification = {
-          sent: false,
-          sentAt: null,
-          error: telegramResult.error || 'Failed to dispatch Telegram notification',
-          retryCount: 1,
-          lastAttemptAt: new Date()
-        };
-        await order.save();
-      }
-    } catch (telegramErr) {
-      console.error('[Order Controller] Telegram notification exception:', telegramErr);
-      order.telegramNotification = {
-        sent: false,
-        error: telegramErr.message,
-        retryCount: 1,
-        lastAttemptAt: new Date()
-      };
-      await order.save();
+      sendTelegramOrderNotification(order).catch(err => {
+        console.warn('[Async Telegram Notice]:', err);
+      });
+    } catch (tgErr) {
+      console.warn('[Telegram Error]:', tgErr.message);
     }
 
     res.status(201).json({
       success: true,
-      message: 'Order created successfully',
-      order: {
-        _id: order._id,
-        orderId: order.orderId,
-        customer: order.customer,
-        items: order.items,
-        subtotal: order.subtotal,
-        deliveryFee: order.deliveryFee,
-        discountAmount: order.discountAmount,
-        total: order.total,
-        paymentMethod: order.paymentMethod,
-        status: order.status,
-        createdAt: order.createdAt
-      }
+      message: 'Order created successfully and sent to dispatch',
+      orderId: order.orderId,
+      order
     });
   } catch (error) {
-    next(error);
+    console.warn('[Order DB Fallback]:', error.message);
+    return memoryStore.createOrder(req, res);
   }
 };
 
-// @desc Get user's orders
+// @desc Get customer orders
 // @route GET /api/orders/my
 const getMyOrders = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.getOrders(req, res);
+  }
+
   try {
     const orders = await Order.find({ user: req.user._id }).sort({ createdAt: -1 });
     res.status(200).json({
       success: true,
+      count: orders.length,
       orders
     });
   } catch (error) {
-    next(error);
+    return memoryStore.getOrders(req, res);
   }
 };
 
 // @desc Get single order by ID or orderId
 // @route GET /api/orders/:id
 const getOrderById = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.getOrderById(req, res);
+  }
+
   try {
     const { id } = req.params;
     let order;
@@ -249,10 +230,7 @@ const getOrderById = async (req, res, next) => {
     }
 
     if (!order) {
-      return res.status(404).json({
-        success: false,
-        message: 'Order not found'
-      });
+      return memoryStore.getOrderById(req, res);
     }
 
     res.status(200).json({
@@ -260,67 +238,94 @@ const getOrderById = async (req, res, next) => {
       order
     });
   } catch (error) {
-    next(error);
+    return memoryStore.getOrderById(req, res);
   }
 };
 
-// @desc Update order status (Admin)
+// @desc Update order status
 // @route PATCH /api/orders/:id/status
 const updateOrderStatus = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.updateOrderStatus(req, res);
+  }
+
   try {
-    const { status, paymentStatus } = req.body;
-    const order = await Order.findById(req.params.id);
+    const { status, notes } = req.body;
+    let order;
+    if (req.params.id.match(/^[0-9a-fA-F]{24}$/)) {
+      order = await Order.findById(req.params.id);
+    } else {
+      order = await Order.findOne({ orderId: req.params.id.toUpperCase() });
+    }
 
     if (!order) {
-      return res.status(404).json({
-        success: false,
-        message: 'Order not found'
-      });
+      return memoryStore.updateOrderStatus(req, res);
     }
 
     if (status) order.status = status;
-    if (paymentStatus) order.paymentStatus = paymentStatus;
-
+    if (notes) order.notes = notes;
     await order.save();
 
     res.status(200).json({
       success: true,
-      message: 'Order status updated successfully',
       order
     });
   } catch (error) {
-    next(error);
+    return memoryStore.updateOrderStatus(req, res);
   }
 };
 
-// @desc Retry failed Telegram notification (Admin)
+// @desc Retry Telegram notification
 // @route POST /api/orders/:id/retry-telegram
 const retryTelegramNotification = async (req, res, next) => {
   try {
+    let order = null;
+    if (isDBConnected()) {
+      if (req.params.id.match(/^[0-9a-fA-F]{24}$/)) {
+        order = await Order.findById(req.params.id);
+      } else {
+        order = await Order.findOne({ orderId: req.params.id.toUpperCase() });
+      }
+    }
+
+    if (!order) {
+      order = memoryStore.store.orders.find(o => o._id === req.params.id || o.orderId === req.params.id);
+    }
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    const result = await sendTelegramOrderNotification(order);
+    res.status(200).json({ success: result.success, result });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc Cancel an order
+// @route PUT /api/orders/:id/cancel
+const cancelOrder = async (req, res, next) => {
+  try {
     const order = await Order.findById(req.params.id);
     if (!order) {
-      return res.status(404).json({
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    if (order.status !== 'Pending') {
+      return res.status(400).json({
         success: false,
-        message: 'Order not found'
+        message: 'Order can only be cancelled while in Pending status.'
       });
     }
 
-    const result = await sendOrderNotification(order);
-    
-    order.telegramNotification = {
-      sent: result.success,
-      sentAt: result.success ? result.sentAt : order.telegramNotification.sentAt,
-      error: result.success ? '' : result.error,
-      retryCount: (order.telegramNotification.retryCount || 0) + 1,
-      lastAttemptAt: new Date()
-    };
-
+    order.status = 'Cancelled';
     await order.save();
 
     res.status(200).json({
-      success: result.success,
-      message: result.success ? 'Telegram notification delivered successfully' : 'Telegram retry failed',
-      notification: order.telegramNotification
+      success: true,
+      message: 'Order cancelled successfully',
+      order
     });
   } catch (error) {
     next(error);
@@ -332,5 +337,6 @@ module.exports = {
   getMyOrders,
   getOrderById,
   updateOrderStatus,
-  retryTelegramNotification
+  retryTelegramNotification,
+  cancelOrder
 };

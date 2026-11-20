@@ -1,0 +1,12 @@
+.git
+.github
+node_modules
+.env
+.env.local
+server/.env
+client/.env
+test_api.js
+server/test_api.js
+server/test_telegram.js
+npm-debug.log*
+.DS_Store

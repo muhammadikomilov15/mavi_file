@@ -1,6 +1,11 @@
 node_modules/
 dist/
+client/dist/
 .env
 .env.local
+server/.env
+client/.env
 .DS_Store
 uploads/
+npm-debug.log*
+.vercel

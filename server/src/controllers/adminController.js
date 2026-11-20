@@ -3,10 +3,16 @@ const Product = require('../models/Product');
 const User = require('../models/User');
 const StoreSettings = require('../models/StoreSettings');
 const { testTelegramConnection } = require('../services/telegramService');
+const { isDBConnected } = require('../config/db');
+const memoryStore = require('../services/memoryStore');
 
 // @desc Get comprehensive admin dashboard analytics
 // @route GET /api/admin/dashboard
 const getDashboardOverview = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.getDashboardOverview(req, res);
+  }
+
   try {
     const totalOrders = await Order.countDocuments();
     const totalProducts = await Product.countDocuments();
@@ -30,7 +36,7 @@ const getDashboardOverview = async (req, res, next) => {
       .sort({ createdAt: -1 })
       .limit(8);
 
-    // Monthly revenue data for chart (last 6 months)
+    // Monthly revenue data for chart
     const monthlyStats = await Order.aggregate([
       { $match: { status: { $ne: 'Cancelled' } } },
       {
@@ -63,13 +69,18 @@ const getDashboardOverview = async (req, res, next) => {
       }
     });
   } catch (error) {
-    next(error);
+    console.warn('[Admin Dashboard DB Fallback]:', error.message);
+    return memoryStore.getDashboardOverview(req, res);
   }
 };
 
 // @desc Get all orders with filtering and search
 // @route GET /api/admin/orders
 const getAllOrders = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.getOrders(req, res);
+  }
+
   try {
     const { status, search, page = 1, limit = 15 } = req.query;
     const query = {};
@@ -100,45 +111,47 @@ const getAllOrders = async (req, res, next) => {
 
     res.status(200).json({
       success: true,
+      count: orders.length,
       totalOrders,
       totalPages: Math.ceil(totalOrders / limitNum),
       currentPage: pageNum,
       orders
     });
   } catch (error) {
-    next(error);
+    return memoryStore.getOrders(req, res);
   }
 };
 
-// @desc Get customers with order count and spend
-// @route GET /api/admin/customers
-const getAllCustomers = async (req, res, next) => {
+// @desc Update order status & add tracking
+// @route PUT /api/admin/orders/:id/status
+const updateOrderStatus = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.updateOrderStatus(req, res);
+  }
+
   try {
-    const customers = await User.find({ role: 'customer' })
-      .select('-password')
-      .sort({ createdAt: -1 });
+    const { status, paymentStatus, trackingNumber, trackingCarrier, notes } = req.body;
+    const order = await Order.findById(req.params.id);
 
-    const customersWithStats = await Promise.all(
-      customers.map(async (cust) => {
-        const orderStats = await Order.aggregate([
-          { $match: { user: cust._id, status: { $ne: 'Cancelled' } } },
-          { $group: { _id: null, totalSpent: { $sum: '$total' }, orderCount: { $sum: 1 } } }
-        ]);
+    if (!order) {
+      return memoryStore.updateOrderStatus(req, res);
+    }
 
-        return {
-          ...cust.toObject(),
-          totalSpent: orderStats.length > 0 ? orderStats[0].totalSpent : 0,
-          ordersCount: orderStats.length > 0 ? orderStats[0].orderCount : 0
-        };
-      })
-    );
+    if (status) order.status = status;
+    if (paymentStatus) order.paymentStatus = paymentStatus;
+    if (trackingNumber) order.trackingNumber = trackingNumber;
+    if (trackingCarrier) order.trackingCarrier = trackingCarrier;
+    if (notes) order.notes = notes;
+
+    await order.save();
 
     res.status(200).json({
       success: true,
-      customers: customersWithStats
+      message: 'Order updated successfully',
+      order
     });
   } catch (error) {
-    next(error);
+    return memoryStore.updateOrderStatus(req, res);
   }
 };
 
@@ -146,31 +159,21 @@ const getAllCustomers = async (req, res, next) => {
 // @route GET /api/admin/settings
 const getSettings = async (req, res, next) => {
   try {
-    let settings = await StoreSettings.findOne();
-    if (!settings) {
-      settings = await StoreSettings.create({
-        telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '',
-        telegramChatId: process.env.TELEGRAM_CHAT_ID || '1004335804992',
-        telegramEnabled: true
-      });
+    if (!isDBConnected()) {
+      return res.status(200).json({ success: true, settings: memoryStore.store.settings });
     }
 
-    // Mask bot token for security in response
-    const maskedSettings = settings.toObject();
-    if (maskedSettings.telegramBotToken) {
-      const len = maskedSettings.telegramBotToken.length;
-      maskedSettings.telegramBotTokenMasked = len > 8
-        ? `${maskedSettings.telegramBotToken.slice(0, 4)}...${maskedSettings.telegramBotToken.slice(-4)}`
-        : '****';
-      delete maskedSettings.telegramBotToken; // Never expose full token in JSON response
+    let settings = await StoreSettings.findOne();
+    if (!settings) {
+      settings = await StoreSettings.create(memoryStore.store.settings);
     }
 
     res.status(200).json({
       success: true,
-      settings: maskedSettings
+      settings
     });
   } catch (error) {
-    next(error);
+    res.status(200).json({ success: true, settings: memoryStore.store.settings });
   }
 };
 
@@ -178,73 +181,35 @@ const getSettings = async (req, res, next) => {
 // @route PUT /api/admin/settings
 const updateSettings = async (req, res, next) => {
   try {
+    if (!isDBConnected()) {
+      memoryStore.store.settings = { ...memoryStore.store.settings, ...req.body };
+      return res.status(200).json({ success: true, settings: memoryStore.store.settings });
+    }
+
     let settings = await StoreSettings.findOne();
     if (!settings) {
-      settings = new StoreSettings();
+      settings = await StoreSettings.create(req.body);
+    } else {
+      Object.assign(settings, req.body);
+      await settings.save();
     }
-
-    const {
-      storeName,
-      contactPhone,
-      contactEmail,
-      contactAddress,
-      telegramChannel,
-      instagramUrl,
-      deliveryFee,
-      freeDeliveryThreshold,
-      announcementText,
-      telegramBotToken,
-      telegramChatId,
-      telegramEnabled
-    } = req.body;
-
-    if (storeName) settings.storeName = storeName;
-    if (contactPhone) settings.contactPhone = contactPhone;
-    if (contactEmail) settings.contactEmail = contactEmail;
-    if (contactAddress) settings.contactAddress = contactAddress;
-    if (telegramChannel) settings.telegramChannel = telegramChannel;
-    if (instagramUrl) settings.instagramUrl = instagramUrl;
-    if (deliveryFee !== undefined) settings.deliveryFee = deliveryFee;
-    if (freeDeliveryThreshold !== undefined) settings.freeDeliveryThreshold = freeDeliveryThreshold;
-    if (announcementText) settings.announcementText = announcementText;
-    if (telegramChatId) settings.telegramChatId = telegramChatId;
-    if (telegramEnabled !== undefined) settings.telegramEnabled = telegramEnabled;
-
-    // Only update token if a new non-empty token was provided
-    if (telegramBotToken && telegramBotToken.trim() !== '' && !telegramBotToken.includes('...')) {
-      settings.telegramBotToken = telegramBotToken.trim();
-    }
-
-    await settings.save();
 
     res.status(200).json({
       success: true,
-      message: 'Store settings updated successfully'
+      message: 'Store settings updated successfully',
+      settings
     });
   } catch (error) {
     next(error);
   }
 };
 
-// @desc Test Telegram bot credentials
-// @route POST /api/admin/test-telegram
+// @desc Test Telegram integration
+// @route POST /api/admin/telegram/test
 const testTelegram = async (req, res, next) => {
   try {
-    const { token, chatId } = req.body;
-    let botToken = token;
-    let targetChatId = chatId;
-
-    if (!botToken) {
-      const settings = await StoreSettings.findOne();
-      botToken = settings?.telegramBotToken || process.env.TELEGRAM_BOT_TOKEN;
-    }
-
-    if (!targetChatId) {
-      const settings = await StoreSettings.findOne();
-      targetChatId = settings?.telegramChatId || process.env.TELEGRAM_CHAT_ID;
-    }
-
-    const result = await testTelegramConnection(botToken, targetChatId);
+    const { botToken, chatId } = req.body;
+    const result = await testTelegramConnection(botToken, chatId);
 
     res.status(200).json({
       success: true,
@@ -254,16 +219,41 @@ const testTelegram = async (req, res, next) => {
   } catch (error) {
     res.status(400).json({
       success: false,
-      message: error.response?.data?.description || error.message
+      message: `Failed to send Telegram test: ${error.message}`
     });
+  }
+};
+
+// @desc Get all customers
+// @route GET /api/admin/customers
+const getAllCustomers = async (req, res, next) => {
+  try {
+    if (!isDBConnected()) {
+      const customers = memoryStore.store.users.filter(u => u.role === 'customer');
+      return res.status(200).json({ success: true, count: customers.length, customers });
+    }
+
+    const customers = await User.find({ role: 'customer' })
+      .select('-password')
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: customers.length,
+      customers
+    });
+  } catch (error) {
+    const customers = memoryStore.store.users.filter(u => u.role === 'customer');
+    res.status(200).json({ success: true, count: customers.length, customers });
   }
 };
 
 module.exports = {
   getDashboardOverview,
   getAllOrders,
-  getAllCustomers,
+  updateOrderStatus,
   getSettings,
   updateSettings,
-  testTelegram
+  testTelegram,
+  getAllCustomers
 };

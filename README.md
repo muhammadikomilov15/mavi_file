@@ -203,3 +203,9 @@ Open **`http://localhost:5173`** in your browser.
 - **Rate Limiting**: Protects `/api` routes against brute force and DDoS attacks.
 - **Helmet Headers**: Injects secure HTTP headers and content security policies.
 - **Sanitized Telegram Messages**: All customer-supplied inputs are HTML-escaped before dispatch to Telegram channels.
+
+---
+
+## ☁️ Vercel Deployment Guide
+For complete step-by-step instructions on deploying the fullstack platform to Vercel with MongoDB Atlas and Telegram notifications, see [VERCEL_DEPLOY_GUIDE.md](file:///c:/mavi%20butique/VERCEL_DEPLOY_GUIDE.md).
+

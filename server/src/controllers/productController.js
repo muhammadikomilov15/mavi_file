@@ -1,8 +1,14 @@
 const Product = require('../models/Product');
+const { isDBConnected } = require('../config/db');
+const memoryStore = require('../services/memoryStore');
 
 // @desc Get all products with advanced filtering, search, sorting & pagination
 // @route GET /api/products
 const getProducts = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.getProducts(req, res);
+  }
+
   try {
     const {
       category,
@@ -108,13 +114,19 @@ const getProducts = async (req, res, next) => {
       products
     });
   } catch (error) {
-    next(error);
+    // If DB error occurs during query, seamlessly fallback to memoryStore
+    console.warn('[Products DB Fallback]:', error.message);
+    return memoryStore.getProducts(req, res);
   }
 };
 
 // @desc Get single product by ID or SKU
 // @route GET /api/products/:id
 const getProductById = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.getProductById(req, res);
+  }
+
   try {
     const { id } = req.params;
     let product;
@@ -126,15 +138,13 @@ const getProductById = async (req, res, next) => {
     }
 
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found'
-      });
+      // Check memory store as fallback
+      return memoryStore.getProductById(req, res);
     }
 
     // Increment views asynchronously
     product.viewsCount = (product.viewsCount || 0) + 1;
-    await product.save({ validateBeforeSave: false });
+    await product.save({ validateBeforeSave: false }).catch(() => {});
 
     // Fetch related products in same category
     const relatedProducts = await Product.find({
@@ -149,13 +159,18 @@ const getProductById = async (req, res, next) => {
       relatedProducts
     });
   } catch (error) {
-    next(error);
+    console.warn('[Product Detail DB Fallback]:', error.message);
+    return memoryStore.getProductById(req, res);
   }
 };
 
 // @desc Create new product (Admin)
 // @route POST /api/products
 const createProduct = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.createProduct(req, res);
+  }
+
   try {
     const product = await Product.create(req.body);
     res.status(201).json({
@@ -170,6 +185,10 @@ const createProduct = async (req, res, next) => {
 // @desc Update product (Admin)
 // @route PUT /api/products/:id
 const updateProduct = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.updateProduct(req, res);
+  }
+
   try {
     const product = await Product.findByIdAndUpdate(
       req.params.id,
@@ -196,6 +215,10 @@ const updateProduct = async (req, res, next) => {
 // @desc Delete product (Admin)
 // @route DELETE /api/products/:id
 const deleteProduct = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.deleteProduct(req, res);
+  }
+
   try {
     const product = await Product.findByIdAndDelete(req.params.id);
     if (!product) {

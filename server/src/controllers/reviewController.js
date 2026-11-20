@@ -1,13 +1,23 @@
 const Review = require('../models/Review');
+const { isDBConnected } = require('../config/db');
+const memoryStore = require('../services/memoryStore');
 
 // @desc Get reviews for a product
 // @route GET /api/reviews/:productId
 const getProductReviews = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.getProductReviews(req, res);
+  }
+
   try {
     const reviews = await Review.find({
       product: req.params.productId,
       isApproved: true
     }).sort({ createdAt: -1 });
+
+    if (!reviews || reviews.length === 0) {
+      return memoryStore.getProductReviews(req, res);
+    }
 
     const totalReviews = reviews.length;
     const averageRating = totalReviews > 0
@@ -21,13 +31,17 @@ const getProductReviews = async (req, res, next) => {
       averageRating: parseFloat(averageRating)
     });
   } catch (error) {
-    next(error);
+    return memoryStore.getProductReviews(req, res);
   }
 };
 
 // @desc Add a review
 // @route POST /api/reviews
 const createReview = async (req, res, next) => {
+  if (!isDBConnected()) {
+    return memoryStore.createReview(req, res);
+  }
+
   try {
     const { productId, name, rating, comment } = req.body;
     if (!productId || !name || !rating || !comment) {
@@ -47,7 +61,7 @@ const createReview = async (req, res, next) => {
       review
     });
   } catch (error) {
-    next(error);
+    return memoryStore.createReview(req, res);
   }
 };
 

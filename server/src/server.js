@@ -3,7 +3,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
-const { connectDB } = require('./config/db');
+const { connectDB, isDBConnected } = require('./config/db');
 const errorHandler = require('./middleware/errorHandler');
 
 // Load environment variables
@@ -17,29 +17,18 @@ app.use(helmet({
 }));
 
 // CORS setup
-const allowedOrigins = [
-  process.env.CLIENT_URL || 'http://localhost:5173',
-  'http://localhost:5174',
-  'http://localhost:3000',
-  'http://127.0.0.1:5173'
-];
-
 app.use(cors({
   origin: function (origin, callback) {
-    // allow requests with no origin (like mobile apps, curl, or server-to-server)
-    if (!origin || allowedOrigins.includes(origin) || origin.startsWith('http://localhost:')) {
-      callback(null, true);
-    } else {
-      callback(null, true); // Permissive in dev
-    }
+    // Allow all origins for seamless e-commerce, mobile, and Vercel preview URLs
+    callback(null, true);
   },
   credentials: true
 }));
 
-// Rate limiting
+// Rate limiting (generous for serverless)
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 1000, // limit each IP to 1000 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later.' }
@@ -50,11 +39,45 @@ app.use('/api', limiter);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Middleware to establish DB connection if configured, without blocking serverless flow
+let initialConnectAttempted = false;
+let seeded = false;
+
+app.use(async (req, res, next) => {
+  if (req.path === '/api/health') {
+    return next();
+  }
+
+  // Attempt DB connection once or check ready state
+  if (!initialConnectAttempted || !isDBConnected()) {
+    try {
+      const connected = await connectDB();
+      if (connected && !seeded && process.env.AUTO_SEED !== 'false') {
+        try {
+          const { seedIfEmpty } = require('./utils/seedData');
+          await seedIfEmpty();
+          seeded = true;
+        } catch (seedErr) {
+          console.warn('[Seed] Notice:', seedErr.message);
+        }
+      }
+    } catch (err) {
+      console.warn('[DB Connect Notice]:', err.message);
+    } finally {
+      initialConnectAttempted = true;
+    }
+  }
+
+  next();
+});
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.status(200).json({
     status: 'online',
-    brand: 'MAVI',
+    brand: 'MAVI BOUTIQUE',
+    database: isDBConnected() ? 'MongoDB Atlas (Connected)' : 'In-Memory Store (Active & Operational)',
+    platform: process.env.VERCEL ? 'Vercel Serverless' : 'Standalone Node.js',
     timestamp: new Date().toISOString(),
     uptime: process.uptime()
   });
@@ -82,28 +105,32 @@ app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 
-// Connect Database & Start Server
+// Connect Database & Start Server for local standalone development
 const startServer = async () => {
   try {
     await connectDB();
     
     // Auto-seed if database is empty
-    const { seedIfEmpty } = require('./utils/seedData');
-    await seedIfEmpty();
+    if (isDBConnected()) {
+      const { seedIfEmpty } = require('./utils/seedData');
+      await seedIfEmpty();
+    }
 
     app.listen(PORT, () => {
       console.log(`====================================================`);
       console.log(`✨ MAVI Premium E-Commerce API running on port ${PORT}`);
-      console.log(`📡 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`📡 Database mode: ${isDBConnected() ? 'MongoDB Atlas' : 'Fast In-Memory'}`);
       console.log(`🛍 Telegram Orders Channel: ${process.env.TELEGRAM_CHAT_ID || '-1004335804992'}`);
       console.log(`====================================================`);
     });
   } catch (error) {
     console.error('Server startup error:', error);
-    process.exit(1);
   }
 };
 
-startServer();
+// Only call app.listen() if executed directly (e.g., node server/src/server.js) and NOT on Vercel
+if (!process.env.VERCEL && require.main === module) {
+  startServer();
+}
 
 module.exports = app;
