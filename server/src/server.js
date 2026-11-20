@@ -25,12 +25,13 @@ app.use(cors({
   credentials: true
 }));
 
-// Rate limiting (generous for serverless)
+// Rate limiting (generous and serverless-friendly)
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: false,
   message: { success: false, message: 'Too many requests, please try again later.' }
 });
 app.use('/api', limiter);
